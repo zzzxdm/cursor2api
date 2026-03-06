@@ -48,14 +48,14 @@ app.get('/v1/models', listModels);
 
 // 健康检查
 app.get('/health', (_req, res) => {
-    res.json({ status: 'ok', version: '2.0.0' });
+    res.json({ status: 'ok', version: '2.3.0' });
 });
 
 // 根路径
 app.get('/', (_req, res) => {
     res.json({
         name: 'cursor2api',
-        version: '2.0.0',
+        version: '2.3.0',
         description: 'Cursor Docs AI → Anthropic & OpenAI API Proxy',
         endpoints: {
             anthropic_messages: 'POST /v1/messages',
@@ -75,7 +75,7 @@ app.get('/', (_req, res) => {
 app.listen(config.port, () => {
     console.log('');
     console.log('  ╔══════════════════════════════════════╗');
-    console.log('  ║        Cursor2API v2.0.0             ║');
+    console.log('  ║        Cursor2API v2.3.0             ║');
     console.log('  ╠══════════════════════════════════════╣');
     console.log(`  ║  Server:  http://localhost:${config.port}      ║`);
     console.log('  ║  Model:   ' + config.cursorModel.padEnd(26) + '║');
