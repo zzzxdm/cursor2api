@@ -19,6 +19,7 @@ import { convertToCursorRequest, parseToolCalls, hasToolCalls } from './converte
 import { sendCursorRequest, sendCursorRequestFull } from './cursor-client.js';
 import { getConfig } from './config.js';
 import { createRequestLogger, type RequestLogger } from './logger.js';
+import { createIncrementalTextStreamer, splitLeadingThinkingBlocks, stripThinkingTags } from './streaming-text.js';
 
 function msgId(): string {
     return 'msg_' + uuidv4().replace(/-/g, '').substring(0, 24);
@@ -628,6 +629,254 @@ export function buildRetryRequest(body: AnthropicRequest, attempt: number): Anth
     return { ...body, messages: newMessages };
 }
 
+function writeAnthropicTextDelta(
+    res: Response,
+    state: { blockIndex: number; textBlockStarted: boolean },
+    text: string,
+): void {
+    if (!text) return;
+
+    if (!state.textBlockStarted) {
+        writeSSE(res, 'content_block_start', {
+            type: 'content_block_start',
+            index: state.blockIndex,
+            content_block: { type: 'text', text: '' },
+        });
+        state.textBlockStarted = true;
+    }
+
+    writeSSE(res, 'content_block_delta', {
+        type: 'content_block_delta',
+        index: state.blockIndex,
+        delta: { type: 'text_delta', text },
+    });
+}
+
+function emitAnthropicThinkingBlock(
+    res: Response,
+    state: { blockIndex: number; textBlockStarted: boolean; thinkingEmitted: boolean },
+    thinkingContent: string,
+): void {
+    if (!thinkingContent || state.thinkingEmitted) return;
+
+    writeSSE(res, 'content_block_start', {
+        type: 'content_block_start',
+        index: state.blockIndex,
+        content_block: { type: 'thinking', thinking: '' },
+    });
+    writeSSE(res, 'content_block_delta', {
+        type: 'content_block_delta',
+        index: state.blockIndex,
+        delta: { type: 'thinking_delta', thinking: thinkingContent },
+    });
+    writeSSE(res, 'content_block_stop', {
+        type: 'content_block_stop',
+        index: state.blockIndex,
+    });
+
+    state.blockIndex++;
+    state.thinkingEmitted = true;
+}
+
+async function handleDirectTextStream(
+    res: Response,
+    cursorReq: CursorChatRequest,
+    body: AnthropicRequest,
+    log: RequestLogger,
+    clientRequestedThinking: boolean,
+    streamState: { blockIndex: number; textBlockStarted: boolean; thinkingEmitted: boolean },
+): Promise<void> {
+    let activeCursorReq = cursorReq;
+    let retryCount = 0;
+    let finalRawResponse = '';
+    let finalVisibleText = '';
+    let finalThinkingContent = '';
+    let streamer = createIncrementalTextStreamer({
+        transform: sanitizeResponse,
+        isBlockedPrefix: (text) => isRefusal(text.substring(0, 300)),
+    });
+
+    const executeAttempt = async (): Promise<{
+        rawResponse: string;
+        visibleText: string;
+        thinkingContent: string;
+        streamer: ReturnType<typeof createIncrementalTextStreamer>;
+    }> => {
+        let rawResponse = '';
+        let visibleText = '';
+        let leadingBuffer = '';
+        let leadingResolved = !clientRequestedThinking;
+        let thinkingContent = '';
+        const attemptStreamer = createIncrementalTextStreamer({
+            transform: sanitizeResponse,
+            isBlockedPrefix: (text) => isRefusal(text.substring(0, 300)),
+        });
+
+        const flushVisible = (chunk: string): void => {
+            if (!chunk) return;
+            visibleText += chunk;
+            const delta = attemptStreamer.push(chunk);
+            if (!delta) return;
+
+            if (clientRequestedThinking && thinkingContent && !streamState.thinkingEmitted) {
+                emitAnthropicThinkingBlock(res, streamState, thinkingContent);
+            }
+            writeAnthropicTextDelta(res, streamState, delta);
+        };
+
+        const apiStart = Date.now();
+        let firstChunk = true;
+        log.startPhase('send', '发送到 Cursor');
+
+        await sendCursorRequest(activeCursorReq, (event: CursorSSEEvent) => {
+            if (event.type !== 'text-delta' || !event.delta) return;
+
+            if (firstChunk) {
+                log.recordTTFT();
+                log.endPhase();
+                log.startPhase('response', '接收响应');
+                firstChunk = false;
+            }
+
+            rawResponse += event.delta;
+
+            if (!clientRequestedThinking) {
+                flushVisible(event.delta);
+                return;
+            }
+
+            if (!leadingResolved) {
+                leadingBuffer += event.delta;
+                const split = splitLeadingThinkingBlocks(leadingBuffer);
+
+                if (split.startedWithThinking) {
+                    if (!split.complete) return;
+                    thinkingContent = split.thinkingContent;
+                    leadingResolved = true;
+                    leadingBuffer = '';
+                    flushVisible(split.remainder);
+                    return;
+                }
+
+                leadingResolved = true;
+                const buffered = leadingBuffer;
+                leadingBuffer = '';
+                flushVisible(buffered);
+                return;
+            }
+
+            flushVisible(event.delta);
+        });
+
+        if (firstChunk) {
+            log.endPhase();
+        } else {
+            log.endPhase();
+        }
+
+        log.recordCursorApiTime(apiStart);
+
+        return {
+            rawResponse,
+            visibleText: clientRequestedThinking ? visibleText : rawResponse,
+            thinkingContent,
+            streamer: attemptStreamer,
+        };
+    };
+
+    while (true) {
+        const attempt = await executeAttempt();
+        finalRawResponse = attempt.rawResponse;
+        finalVisibleText = attempt.visibleText;
+        finalThinkingContent = attempt.thinkingContent;
+        streamer = attempt.streamer;
+
+        const textForRefusalCheck = clientRequestedThinking
+            ? finalVisibleText
+            : stripThinkingTags(finalRawResponse);
+
+        if (!streamer.hasSentText() && isRefusal(textForRefusalCheck) && retryCount < MAX_REFUSAL_RETRIES) {
+            retryCount++;
+            log.warn('Handler', 'retry', `检测到拒绝（第${retryCount}次），自动重试`, {
+                preview: textForRefusalCheck.substring(0, 200),
+            });
+            log.updateSummary({ retryCount });
+            const retryBody = buildRetryRequest(body, retryCount - 1);
+            activeCursorReq = await convertToCursorRequest(retryBody);
+            continue;
+        }
+
+        break;
+    }
+
+    log.recordRawResponse(finalRawResponse);
+    log.info('Handler', 'response', `原始响应: ${finalRawResponse.length} chars`, {
+        preview: finalRawResponse.substring(0, 300),
+        hasTools: false,
+    });
+
+    if (!finalThinkingContent && finalRawResponse.includes('<thinking>')) {
+        const thinkingMatch = finalRawResponse.match(/<thinking>([\s\S]*?)<\/thinking>/g);
+        if (thinkingMatch) {
+            finalThinkingContent = thinkingMatch.map(m => m.replace(/<\/?thinking>/g, '').trim()).join('\n\n');
+        }
+    }
+
+    if (finalThinkingContent) {
+        log.recordThinking(finalThinkingContent);
+        log.updateSummary({ thinkingChars: finalThinkingContent.length });
+        if (clientRequestedThinking) {
+            log.info('Handler', 'thinking', `剥离 thinking → content block: ${finalThinkingContent.length} chars, 剩余 ${finalVisibleText.length} chars`);
+        } else {
+            log.info('Handler', 'thinking', `保留 thinking 在正文中 (非客户端请求): ${finalThinkingContent.length} chars`);
+        }
+    }
+
+    let finalTextToSend: string;
+    const refusalText = clientRequestedThinking ? finalVisibleText : stripThinkingTags(finalRawResponse);
+    const usedFallback = !streamer.hasSentText() && isRefusal(refusalText);
+    if (usedFallback) {
+        if (isToolCapabilityQuestion(body)) {
+            log.info('Handler', 'refusal', '工具能力询问被拒绝 → 返回 Claude 能力描述');
+            finalTextToSend = CLAUDE_TOOLS_RESPONSE;
+        } else {
+            log.warn('Handler', 'refusal', `重试${MAX_REFUSAL_RETRIES}次后仍被拒绝 → 降级为 Claude 身份回复`);
+            finalTextToSend = CLAUDE_IDENTITY_RESPONSE;
+        }
+    } else {
+        finalTextToSend = streamer.finish();
+    }
+
+    if (!usedFallback && clientRequestedThinking && finalThinkingContent && !streamState.thinkingEmitted) {
+        emitAnthropicThinkingBlock(res, streamState, finalThinkingContent);
+    }
+
+    writeAnthropicTextDelta(res, streamState, finalTextToSend);
+
+    if (streamState.textBlockStarted) {
+        writeSSE(res, 'content_block_stop', {
+            type: 'content_block_stop',
+            index: streamState.blockIndex,
+        });
+        streamState.blockIndex++;
+    }
+
+    writeSSE(res, 'message_delta', {
+        type: 'message_delta',
+        delta: { stop_reason: 'end_turn', stop_sequence: null },
+        usage: { output_tokens: Math.ceil((streamer.hasSentText() ? (finalVisibleText || finalRawResponse) : finalTextToSend).length / 4) },
+    });
+    writeSSE(res, 'message_stop', { type: 'message_stop' });
+
+    const finalRecordedResponse = streamer.hasSentText()
+        ? sanitizeResponse(clientRequestedThinking ? finalVisibleText : finalRawResponse)
+        : finalTextToSend;
+    log.recordFinalResponse(finalRecordedResponse);
+    log.complete(finalRecordedResponse.length, 'end_turn');
+
+    res.end();
+}
+
 // ==================== 流式处理 ====================
 
 async function handleStream(res: Response, cursorReq: CursorChatRequest, body: AnthropicRequest, log: RequestLogger, clientRequestedThinking: boolean = false): Promise<void> {
@@ -666,6 +915,7 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
     let sentText = '';
     let blockIndex = 0;
     let textBlockStarted = false;
+    let thinkingBlockEmitted = false;
 
     // 无工具模式：先缓冲全部响应再检测拒绝，如果是拒绝则重试
     let activeCursorReq = cursorReq;
@@ -686,6 +936,15 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
     };
 
     try {
+        if (!hasTools) {
+            await handleDirectTextStream(res, cursorReq, body, log, clientRequestedThinking, {
+                blockIndex,
+                textBlockStarted,
+                thinkingEmitted: thinkingBlockEmitted,
+            });
+            return;
+        }
+
         await executeStream();
 
         log.recordRawResponse(fullResponse);

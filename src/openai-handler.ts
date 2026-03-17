@@ -28,6 +28,7 @@ import { convertToCursorRequest, parseToolCalls, hasToolCalls } from './converte
 import { sendCursorRequest, sendCursorRequestFull } from './cursor-client.js';
 import { getConfig } from './config.js';
 import { createRequestLogger } from './logger.js';
+import { createIncrementalTextStreamer, splitLeadingThinkingBlocks, stripThinkingTags } from './streaming-text.js';
 import {
     isRefusal,
     sanitizeResponse,
@@ -375,6 +376,187 @@ function handleOpenAIMockNonStream(res: Response, body: OpenAIChatRequest, mockT
     });
 }
 
+function writeOpenAITextDelta(
+    res: Response,
+    id: string,
+    created: number,
+    model: string,
+    text: string,
+): void {
+    if (!text) return;
+    writeOpenAISSE(res, {
+        id,
+        object: 'chat.completion.chunk',
+        created,
+        model,
+        choices: [{
+            index: 0,
+            delta: { content: text },
+            finish_reason: null,
+        }],
+    });
+}
+
+function writeOpenAIReasoningDelta(
+    res: Response,
+    id: string,
+    created: number,
+    model: string,
+    reasoningContent: string,
+): void {
+    if (!reasoningContent) return;
+    writeOpenAISSE(res, {
+        id,
+        object: 'chat.completion.chunk',
+        created,
+        model,
+        choices: [{
+            index: 0,
+            delta: { reasoning_content: reasoningContent } as Record<string, unknown>,
+            finish_reason: null,
+        }],
+    });
+}
+
+async function handleOpenAIIncrementalTextStream(
+    res: Response,
+    cursorReq: CursorChatRequest,
+    body: OpenAIChatRequest,
+    anthropicReq: AnthropicRequest,
+    streamMeta: { id: string; created: number; model: string },
+): Promise<void> {
+    let activeCursorReq = cursorReq;
+    let retryCount = 0;
+    const thinkingEnabled = anthropicReq.thinking?.type === 'enabled';
+    let finalRawResponse = '';
+    let finalVisibleText = '';
+    let finalReasoningContent = '';
+    let streamer = createIncrementalTextStreamer({
+        transform: sanitizeResponse,
+        isBlockedPrefix: (text) => isRefusal(text.substring(0, 300)),
+    });
+    let reasoningSent = false;
+
+    const executeAttempt = async (): Promise<{
+        rawResponse: string;
+        visibleText: string;
+        reasoningContent: string;
+        streamer: ReturnType<typeof createIncrementalTextStreamer>;
+    }> => {
+        let rawResponse = '';
+        let visibleText = '';
+        let leadingBuffer = '';
+        let leadingResolved = false;
+        let reasoningContent = '';
+        const attemptStreamer = createIncrementalTextStreamer({
+            transform: sanitizeResponse,
+            isBlockedPrefix: (text) => isRefusal(text.substring(0, 300)),
+        });
+
+        const flushVisible = (chunk: string): void => {
+            if (!chunk) return;
+            visibleText += chunk;
+            const delta = attemptStreamer.push(chunk);
+            if (!delta) return;
+
+            if (thinkingEnabled && reasoningContent && !reasoningSent) {
+                writeOpenAIReasoningDelta(res, streamMeta.id, streamMeta.created, streamMeta.model, reasoningContent);
+                reasoningSent = true;
+            }
+            writeOpenAITextDelta(res, streamMeta.id, streamMeta.created, streamMeta.model, delta);
+        };
+
+        await sendCursorRequest(activeCursorReq, (event: CursorSSEEvent) => {
+            if (event.type !== 'text-delta' || !event.delta) return;
+
+            rawResponse += event.delta;
+
+            if (!leadingResolved) {
+                leadingBuffer += event.delta;
+                const split = splitLeadingThinkingBlocks(leadingBuffer);
+
+                if (split.startedWithThinking) {
+                    if (!split.complete) return;
+                    reasoningContent = split.thinkingContent;
+                    leadingResolved = true;
+                    leadingBuffer = '';
+                    flushVisible(split.remainder);
+                    return;
+                }
+
+                leadingResolved = true;
+                const buffered = leadingBuffer;
+                leadingBuffer = '';
+                flushVisible(buffered);
+                return;
+            }
+
+            flushVisible(event.delta);
+        });
+
+        return {
+            rawResponse,
+            visibleText,
+            reasoningContent,
+            streamer: attemptStreamer,
+        };
+    };
+
+    while (true) {
+        const attempt = await executeAttempt();
+        finalRawResponse = attempt.rawResponse;
+        finalVisibleText = attempt.visibleText;
+        finalReasoningContent = attempt.reasoningContent;
+        streamer = attempt.streamer;
+
+        const textForRefusalCheck = finalVisibleText;
+
+        if (!streamer.hasSentText() && isRefusal(textForRefusalCheck) && retryCount < MAX_REFUSAL_RETRIES) {
+            retryCount++;
+            const retryBody = buildRetryRequest(anthropicReq, retryCount - 1);
+            activeCursorReq = await convertToCursorRequest(retryBody);
+            reasoningSent = false;
+            continue;
+        }
+
+        break;
+    }
+
+    const refusalText = finalVisibleText;
+    const usedFallback = !streamer.hasSentText() && isRefusal(refusalText);
+
+    let finalTextToSend: string;
+    if (usedFallback) {
+        finalTextToSend = isToolCapabilityQuestion(anthropicReq)
+            ? CLAUDE_TOOLS_RESPONSE
+            : CLAUDE_IDENTITY_RESPONSE;
+    } else {
+        finalTextToSend = streamer.finish();
+    }
+
+    if (!usedFallback && thinkingEnabled && finalReasoningContent && !reasoningSent) {
+        writeOpenAIReasoningDelta(res, streamMeta.id, streamMeta.created, streamMeta.model, finalReasoningContent);
+        reasoningSent = true;
+    }
+
+    writeOpenAITextDelta(res, streamMeta.id, streamMeta.created, streamMeta.model, finalTextToSend);
+
+    writeOpenAISSE(res, {
+        id: streamMeta.id,
+        object: 'chat.completion.chunk',
+        created: streamMeta.created,
+        model: streamMeta.model,
+        choices: [{
+            index: 0,
+            delta: {},
+            finish_reason: 'stop',
+        }],
+    });
+
+    res.write('data: [DONE]\n\n');
+    res.end();
+}
+
 // ==================== 流式处理（OpenAI SSE 格式） ====================
 
 async function handleOpenAIStream(
@@ -420,6 +602,11 @@ async function handleOpenAIStream(
     };
 
     try {
+        if (!hasTools && (!body.response_format || body.response_format.type === 'text')) {
+            await handleOpenAIIncrementalTextStream(res, cursorReq, body, anthropicReq, { id, created, model });
+            return;
+        }
+
         await executeStream();
 
         // 日志记录在详细日志中 (Web UI 可见)
@@ -433,7 +620,7 @@ async function handleOpenAIStream(
                 if (thinkingEnabled) {
                     reasoningContent = thinkingMatch.map(m => m.replace(/<\/?thinking>/g, '').trim()).join('\n\n');
                 }
-                fullResponse = fullResponse.replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '').trim();
+                fullResponse = stripThinkingTags(fullResponse);
                 // thinking 剥离记录在详细日志中
             }
         }
