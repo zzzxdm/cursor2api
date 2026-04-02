@@ -65,12 +65,16 @@ async function initBrowser() {
         timeout: 60000,
     });
 
+    // 模拟人类行为，帮助通过 bot 检测
+    await simulateHumanBehavior(challengePage);
+
     // 等待 cookie（challenge JS 会异步设置 _vcrcs）
     const ok = await waitForCookie();
     if (!ok) {
-        // 重试一次：刷新页面再等
+        // 重试：刷新页面 + 再次模拟行为
         console.log('[Stealth] First attempt failed, retrying challenge...');
         await challengePage.reload({ waitUntil: 'domcontentloaded', timeout: 60000 });
+        await simulateHumanBehavior(challengePage);
         const retryOk = await waitForCookie();
         if (!retryOk) {
             throw new Error('Failed to obtain _vcrcs cookie after retry');
@@ -147,6 +151,38 @@ async function waitForCookie(maxWait) {
     }
     console.error('[Stealth] Failed to obtain _vcrcs within timeout');
     return false;
+}
+
+// 模拟人类行为：鼠标移动、点击、滚动，帮助通过 Vercel bot 检测
+async function simulateHumanBehavior(page) {
+    try {
+        // 随机延迟
+        await new Promise(r => setTimeout(r, 500 + Math.random() * 1000));
+
+        // 模拟鼠标移动轨迹（多个随机点）
+        const points = Array.from({ length: 5 }, () => ({
+            x: 100 + Math.random() * 600,
+            y: 100 + Math.random() * 400,
+        }));
+        for (const p of points) {
+            await page.mouse.move(p.x, p.y, { steps: 5 + Math.floor(Math.random() * 10) });
+            await new Promise(r => setTimeout(r, 100 + Math.random() * 300));
+        }
+
+        // 模拟滚动
+        await page.mouse.wheel(0, 100 + Math.random() * 200);
+        await new Promise(r => setTimeout(r, 300 + Math.random() * 500));
+        await page.mouse.wheel(0, -(50 + Math.random() * 100));
+
+        // 模拟点击页面空白区域
+        await page.mouse.click(300 + Math.random() * 400, 300 + Math.random() * 200);
+        await new Promise(r => setTimeout(r, 200 + Math.random() * 500));
+
+        console.log('[Stealth] Human behavior simulation done');
+    } catch (e) {
+        // 模拟行为失败不影响主流程
+        console.log('[Stealth] Human simulation skipped:', e.message);
+    }
 }
 
 async function refreshChallenge() {
